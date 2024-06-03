@@ -15,11 +15,12 @@
 
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import { KintoneRestAPIClient } from "@kintone/rest-api-client";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { createWriteStream, createReadStream } from "fs";
 import fs from 'fs';
 import { Readable } from "stream";
 import { parse } from 'csv-parse/sync';
+import moment from "moment";
 
 /* kintoneのシークレット情報を取得する */
 /* const secret_name = "anabuki-kubun-kintone"; */
@@ -32,11 +33,21 @@ const client = new SecretsManagerClient({
 /* メイン関数 */
 export const handler = async () => {
   try {
+    /* AWSからシークレット情報を取得する */
     const secret = await getAwsSecret();
-    // console.log(secret);
-    // const records = await fetchKintoneData(secret);
-    // console.log(records);
-    await fetchS3Data(secret);
+
+    /* s3のクライアントを作成 */
+    const s3Client = new S3Client({
+      region: "ap-northeast-1",
+      credentials: {
+        accessKeyId: secret.awsAccessKey,
+        secretAccessKey: secret.awsSecretKey,
+      },
+    });
+    /* Kintoneからデータを取得する */
+    const records = await fetchKintoneData(secret);
+
+    await fetchS3Data(secret, records, s3Client);
     // console.log(records);
   } catch (error) {
     // For a list of exceptions thrown, see
@@ -45,18 +56,6 @@ export const handler = async () => {
     throw error;
   }
 };
-
-
-/* AWS Secret Managerからシークレット情報を取得する */
-async function getAwsSecret() {
-  const res = await client.send(
-    new GetSecretValueCommand({
-      SecretId: secret_name,
-    })
-  );
-  const secret = JSON.parse(res.SecretString);
-  return secret;
-}
 
 /* Kintoneからデータを取得する */
 async function fetchKintoneData(secret) {
@@ -83,15 +82,7 @@ async function fetchKintoneData(secret) {
 }
 
 /* S3データを読みとる */
-async function fetchS3Data(secret) {
-  // AWS 認証情報の設定
-  const s3Client = new S3Client({
-    region: "ap-northeast-1",
-    credentials: {
-      accessKeyId: secret.awsAccessKey,
-      secretAccessKey: secret.awsSecretKey,
-    },
-  });
+async function fetchS3Data(secret, records, s3Client) {
 
   const objectKey = "data-pipeline-test.csv";
   const command = new GetObjectCommand({
@@ -101,10 +92,10 @@ async function fetchS3Data(secret) {
 
   try {
     const response = await s3Client.send(command);
-    const downloadPath = '/tmp/';
+    // const downloadPath = '/tmp/';
+    const downloadPath = './';    
     const fileName = objectKey;
     const filePath = downloadPath + fileName;
-
     const body = response.Body;
 
     /* tmpに保管 */
@@ -113,30 +104,81 @@ async function fetchS3Data(secret) {
       body
         .pipe(writeStream)
         .on("error", (err) => console.log(err))
-        .on("close", () => console.log(null));
+        .on("close", () => console.log("ダウンロード完了"))
+
+        /* kintoneから取得したレコードをCSVに書き込む */
+        let newRows = "";
+        records.forEach((record) => {
+          const newRow = setNewRecord(record);
+          newRows += newRow;
+          // console.log(newRow);
+        })
+
+        fs.writeFileSync(filePath, newRows, { flag: 'a' });
+        /* fs.writeFileSync 関数の flag オプションに 'a' を指定すると、
+          ファイル末尾に追記するようになります。既存のデータを上書きせずに追記したい場合は、このオプションを使用します。 
+        */
+
+        /* 書き込む用のデータを確認する */
+        const csvData = fs.readFileSync(filePath);
+        // const csvRecords = parse(csvData, { columns: true, delimiter: ',' });
+        // for (const rec of csvRecords) {
+        //   console.log(rec);
+        // }
+
+      /* 更新データをアップをアップロード */
+      const updateCommand = new PutObjectCommand({
+        Bucket: "mirai-property-master",
+        Key: objectKey,
+        Body: csvData,
+      });
+      await s3Client.send(updateCommand)
+      return;
     }
 
-    /* tmpにダウンロードしたデータを読み取り */
-    const csvData = fs.readFileSync(filePath);
-    // console.log(csvData);
-
-    const records = parse(csvData, { columns: true, delimiter: ',' });
-    for (const record of records) {
-      console.log(record);
-    }
-    return;
-
-  }catch(err){
+  } catch (err) {
     console.log(err);
     return err;
   }
 }
 
-
-/* 作成日、更新日データの変換 */
-const formatDate = (dateString) => {
-  return moment(dateString).format('YYYY-MM-DD');
+/* AWS Secret Managerからシークレット情報を取得する */
+async function getAwsSecret() {
+  const res = await client.send(
+    new GetSecretValueCommand({
+      SecretId: secret_name,
+    })
+  );
+  const secret = JSON.parse(res.SecretString);
+  return secret;
 }
 
+/* アップロード対象のデータを*/
+function setNewRecord(record) {
+
+  const created_date = formatDate(record["作成日時"].value);
+  const updated_date = formatDate(record["更新日時"].value);
+
+  const newRecord = {
+    "レコード番号": record["レコード番号"].value,
+    name: record.name.value,
+    number: record.number.value,
+    "更新者": record["更新者"].value.name,
+    "作成者": record["作成者"].value.name,
+    "更新日時": updated_date,
+    "作成日時": created_date
+  }
+  const csvString = `"${newRecord["レコード番号"]}","${newRecord.name}","${newRecord.number}","${newRecord["更新者"]}","${newRecord["作成者"]}","${newRecord["更新日時"]}","${newRecord["作成日時"]}"\n`;
+  // const csvString = `${newRecord["レコード番号"]},${newRecord.name},${newRecord.number},${newRecord["更新者"]},${newRecord["作成者"]},${newRecord["更新日時"]},${newRecord["作成日時"]}`;
+  return csvString;
+}
+
+/* データ型をkintoneに合わせる */
+function formatDate(dateString) {
+  // Moment.jsを使用して日付をパース
+  const parsedDate = moment(dateString);
+  // フォーマットされた日付文字列を返す
+  return parsedDate.format('YYYY/MM/DD hh:mm');
+}
 
 handler();
